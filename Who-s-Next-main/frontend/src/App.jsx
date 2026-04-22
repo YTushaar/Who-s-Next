@@ -74,14 +74,14 @@ const App = () => {
 
   /* ---------------- LOAD API CREDITS ---------------- */
   useEffect(() => {
-    axios.get("http://127.0.0.1:8000/credits")
+    axios.get(`${import.meta.env.VITE_API_URL}/credits`)
       .then(res => setApiCredits(res.data.remaining))
       .catch(() => console.error("Could not fetch credits"));
   }, []);
 
   /* ---------------- LOAD FILTER OPTIONS ---------------- */
   useEffect(() => {
-    axios.get("http://127.0.0.1:8000/filters")
+    axios.get(`${import.meta.env.VITE_API_URL}/filters`)
       .then(res => {
         setFilters(res.data);
         setSelectedDepts([]);
@@ -109,7 +109,7 @@ const App = () => {
   /* ---------------- FETCH DASHBOARD STATS ---------------- */
   useEffect(() => {
     if (viewMode === "overview" && (selectedDepts.length > 0 || selectedRoles.length > 0)) {
-      axios.post("http://127.0.0.1:8000/stats", {
+      axios.post(`${import.meta.env.VITE_API_URL}/stats`, {
         departments: selectedDepts,
         job_roles: selectedRoles
       }).then(res => setOverviewData(res.data)).catch(() => setOverviewData(null));
@@ -120,7 +120,7 @@ const App = () => {
 
   useEffect(() => {
     if (viewMode === "profile") {
-      axios.get("http://127.0.0.1:8000/employees")
+      axios.get(`${import.meta.env.VITE_API_URL}/employees`)
         .then(res => setEmployees(res.data))
         .catch(() => console.error("Failed to load employees"));
     }
@@ -128,7 +128,7 @@ const App = () => {
 
   useEffect(() => {
     setIsLoadingTopRisk(true);
-    axios.get("http://127.0.0.1:8000/top_risk_employees")
+    axios.get(`${import.meta.env.VITE_API_URL}/top_risk_employees`)
       .then(res => { setTopRiskEmployees(res.data); setIsLoadingTopRisk(false); })
       .catch(() => { setTopRiskEmployees([]); setIsLoadingTopRisk(false); });
   }, []);
@@ -208,7 +208,7 @@ const App = () => {
                     <input type="text" value={selectedEmployeeId} onChange={(e) => setSelectedEmployeeId(e.target.value)} placeholder="Enter ID" className="flex-1 p-2 border rounded-lg text-sm" />
                     <button onClick={() => {
                       if (selectedEmployeeId) {
-                        axios.get(`http://127.0.0.1:8000/employee/${selectedEmployeeId}`)
+                        axios.get(`${import.meta.env.VITE_API_URL}/employee/${selectedEmployeeId}`)
                           .then(res => {
                             if (res.data.error) { setEmployeeError("Not found."); setEmployeeDetails(null); } 
                             else { setEmployeeDetails(res.data); setEmployeeError(""); }
@@ -249,7 +249,7 @@ const App = () => {
                   onClick={() => {
                     if (employeeDetails && selectedModel) {
                       setIsLoadingPrediction(true);
-                      axios.post("http://127.0.0.1:8000/predict", {
+                      axios.post(`${import.meta.env.VITE_API_URL}/predict`, {
                         employee_id: employeeDetails.employee_id,
                         model_name: selectedModel.toLowerCase().replace(" ", "_"),
                         what_if: {
@@ -445,7 +445,7 @@ const App = () => {
                       <button
                         onClick={() => {
                           setIsLoadingRecs(true);
-                          axios.post("http://127.0.0.1:8000/generate_recommendations", {
+                          axios.post(`${import.meta.env.VITE_API_URL}/generate_recommendations`, {
                             employee_id: employeeDetails.employee_id,
                             risk_probability: predictionResult.riskPercentage,
                             risk_level: predictionResult.riskLabel,
