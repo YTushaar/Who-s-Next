@@ -31,9 +31,7 @@ build/
 .env.test.local
 .env.production.local
 
---- Datasets (Too large for Git) ---
 
-*.csv
 *.xlsx
 *.xls
 
