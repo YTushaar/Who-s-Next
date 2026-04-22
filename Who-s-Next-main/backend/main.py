@@ -1,0 +1,367 @@
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional, Dict, Union
+import pandas as pd
+import numpy as np
+import joblib
+import os
+import json
+from sklearn.metrics import accuracy_score, recall_score, roc_auc_score
+from google import genai
+from dotenv import load_dotenv
+
+# --------------------------------------------------
+# ENVIRONMENT & SECRETS
+# --------------------------------------------------
+# Load variables from .env into the environment
+load_dotenv()
+
+# Initialize the Gemini client. 
+# It automatically finds GEMINI_API_KEY from the environment.
+gemini_client = genai.Client()
+
+# --------------------------------------------------
+# APP SETUP
+# --------------------------------------------------
+app = FastAPI(title="Employee Attrition Analytics API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------------------------------
+# LOAD DATA & MODELS
+# --------------------------------------------------
+df = pd.read_csv("WA_Fn-UseC_-HR-Employee-Attrition.csv")
+
+models = {
+    "logistic_regression": joblib.load("model_logreg_best.joblib"),
+    "random_forest": joblib.load("model_rf_best.joblib"),
+    "gradient_boosting": joblib.load("model_gb_best.joblib"),
+}
+rf_model = joblib.load("model_rf_best.joblib")
+feature_columns = joblib.load("model_feature_columns.joblib")
+TOP_RISK_CACHE = None
+
+# --------------------------------------------------
+# COMPUTE MODEL METRICS
+# --------------------------------------------------
+def compute_model_metrics():
+    X = pd.get_dummies(df.drop("Attrition", axis=1))
+    X = X.reindex(columns=feature_columns, fill_value=0)
+    y = df["Attrition"].map({"Yes": 1, "No": 0})
+
+    metrics = {}
+    for name, model in models.items():
+        y_pred = model.predict(X)
+        y_pred_proba = model.predict_proba(X)[:, 1]
+        accuracy = accuracy_score(y, y_pred)
+        recall = recall_score(y, y_pred, pos_label=1)
+        auc = roc_auc_score(y, y_pred_proba)
+        metrics[name] = {
+            "accuracy": round(accuracy, 2),
+            "recall": round(recall, 2),
+            "auc": round(auc, 2)
+        }
+    ensemble_acc = np.mean([metrics[m]["accuracy"] for m in metrics])
+    ensemble_recall = np.mean([metrics[m]["recall"] for m in metrics])
+    ensemble_auc = np.mean([metrics[m]["auc"] for m in metrics])
+    metrics["ensemble"] = {
+        "accuracy": round(ensemble_acc, 2),
+        "recall": round(ensemble_recall, 2),
+        "auc": round(ensemble_auc, 2)
+    }
+    return metrics
+
+MODEL_METRICS = compute_model_metrics()
+
+# --------------------------------------------------
+# JOB ROLE MAPPING
+# --------------------------------------------------
+JOB_ROLE_BY_DEPARTMENT = {
+    "Research & Development": [
+        "Laboratory Technician", "Research Scientist", "Manufacturing Director",
+        "Healthcare Representative", "Research Director"
+    ],
+    "Sales": ["Sales Executive", "Sales Representative", "Manager"],
+    "Human Resources": ["Human Resources"]
+}
+
+# --------------------------------------------------
+# REQUEST MODELS & GLOBALS
+# --------------------------------------------------
+class StatsFilter(BaseModel):
+    departments: Optional[List[str]] = None
+    job_roles: Optional[List[str]] = None
+
+class PredictRequest(BaseModel):
+    employee_id: int
+    model_name: str = "random_forest"
+    what_if: Optional[Dict[str, Union[str, int]]] = {}
+
+class RecommendationRequest(BaseModel):
+    employee_id: int
+    risk_probability: float
+    risk_level: str
+    key_drivers: list
+
+# Simple in-memory counter for your presentation
+DAILY_LIMIT = 250
+credits_used = 0
+
+@app.get("/credits")
+def get_credits():
+    return {"remaining": DAILY_LIMIT - credits_used, "limit": DAILY_LIMIT}
+
+# --------------------------------------------------
+# HELPER FUNCTIONS
+# --------------------------------------------------
+def attrition_agg(data: pd.DataFrame, col: str):
+    return (
+        data[data["Attrition"] == "Yes"][col]
+        .value_counts()
+        .reset_index()
+        .rename(columns={"index": "name", col: "value"})
+        .to_dict("records")
+    )
+
+def build_feature_vector(row: pd.Series):
+    X = pd.DataFrame([row])
+    X = pd.get_dummies(X)
+    X = X.reindex(columns=feature_columns, fill_value=0)
+    return X
+
+def get_contribution(feature, value, df):
+    if feature == "OverTime":
+        val_num = 1 if value == "Yes" else 0
+        percentile = (df[feature].map({"No": 0, "Yes": 1}) <= val_num).mean() * 100
+        return round(percentile, 1)
+    elif feature in ["JobSatisfaction", "WorkLifeBalance", "MonthlyIncome", "YearsWithCurrManager"]:
+        percentile = (df[feature] <= value).mean() * 100
+        return round(100 - percentile, 1)
+    elif feature in ["YearsAtCompany", "YearsSinceLastPromotion"]:
+        percentile = (df[feature] <= value).mean() * 100
+        return round(percentile, 1)
+    else:
+        return 25.0
+
+def generate_recommendations(row: pd.Series, what_if: Dict[str, Union[str, int]]):
+    key_drivers = []
+    eval_row = row.copy()
+    for feature, value in what_if.items():
+        if feature in eval_row:
+            eval_row[feature] = value
+
+    # Overtime
+    overtime = eval_row.get("OverTime", "No")
+    impact = "High" if overtime == "Yes" else "Low"
+    key_drivers.append({"factor": "Overtime", "impact": impact, "contribution": get_contribution("OverTime", overtime, df)})
+
+    # Job Satisfaction
+    job_sat = eval_row.get("JobSatisfaction", 3)
+    impact = "High" if job_sat == 1 else "Medium" if job_sat == 2 else "Low"
+    key_drivers.append({"factor": "Job Satisfaction", "impact": impact, "contribution": get_contribution("JobSatisfaction", job_sat, df)})
+
+    # Work Life Balance
+    wlb = eval_row.get("WorkLifeBalance", 3)
+    impact = "High" if wlb == 1 else "Medium" if wlb == 2 else "Low"
+    key_drivers.append({"factor": "Work-Life Balance", "impact": impact, "contribution": get_contribution("WorkLifeBalance", wlb, df)})
+
+    # Monthly Income
+    income = eval_row.get("MonthlyIncome", 5000)
+    impact = "High" if income < 4000 else "Low"
+    key_drivers.append({"factor": "Monthly Income", "impact": impact, "contribution": get_contribution("MonthlyIncome", income, df)})
+
+    # Years at Company
+    tenure = eval_row.get("YearsAtCompany", 5)
+    impact = "High" if tenure > 10 else "Low"
+    key_drivers.append({"factor": "Years at Company", "impact": impact, "contribution": get_contribution("YearsAtCompany", tenure, df)})
+
+    # Years with Manager
+    years_mgr = eval_row.get("YearsWithCurrManager", 3)
+    impact = "High" if years_mgr < 2 else "Low"
+    key_drivers.append({"factor": "Years with Manager", "impact": impact, "contribution": get_contribution("YearsWithCurrManager", years_mgr, df)})
+
+    # Recent Promotion
+    years_last_promo = eval_row.get("YearsSinceLastPromotion", 2)
+    impact = "High" if years_last_promo > 5 else "Low"
+    key_drivers.append({"factor": "Recent Promotion", "impact": impact, "contribution": get_contribution("YearsSinceLastPromotion", years_last_promo, df)})
+
+    return None, key_drivers # Recommendations removed, handled by LLM now
+
+# --------------------------------------------------
+# DASHBOARD ENDPOINTS
+# --------------------------------------------------
+def compute_top_risk_employees(limit=5):
+    risk_scores = []
+    for _, row in df.iterrows():
+        X = pd.DataFrame([row])
+        X = pd.get_dummies(X)
+        X = X.reindex(columns=feature_columns, fill_value=0)
+        prob = rf_model.predict_proba(X)[0][1]
+
+        risk_scores.append({
+            "employee_id": int(row["EmployeeNumber"]),
+            "department": row["Department"],
+            "job_role": row["JobRole"],
+            "job_level": int(row["JobLevel"]),
+            "years_at_company": int(row["YearsAtCompany"]),
+            "monthly_income": float(row["MonthlyIncome"]),
+            "risk_probability": round(float(prob) * 100, 2),
+            "risk_level": "High" if prob >= 0.7 else "Medium" if prob >= 0.4 else "Low"
+        })
+
+    risk_scores.sort(key=lambda x: x["risk_probability"], reverse=True)
+    return risk_scores[:limit]
+
+@app.post("/stats")
+def get_dashboard_stats(filters: StatsFilter):
+    filtered_df = df.copy()
+    if filters.departments:
+        filtered_df = filtered_df[filtered_df["Department"].isin(filters.departments)]
+    if filters.job_roles:
+        filtered_df = filtered_df[filtered_df["JobRole"].isin(filters.job_roles)]
+
+    total_employees = len(filtered_df)
+    attrition_count = len(filtered_df[filtered_df["Attrition"] == "Yes"])
+
+    filtered_df["TenureBand"] = pd.cut(filtered_df["YearsAtCompany"], bins=[0, 2, 5, 10, 40], labels=["0–2", "2–5", "5–10", "10+"])
+    filtered_df["IncomeBand"] = pd.qcut(filtered_df["MonthlyIncome"], q=4, labels=["Low", "Medium", "High", "Very High"])
+
+    return {
+        "kpis": {
+            "total_employees": total_employees,
+            "attrition_rate": round((attrition_count / total_employees) * 100, 2) if total_employees else 0,
+            "avg_satisfaction": round(filtered_df["EnvironmentSatisfaction"].mean(), 2),
+            "high_risk_employees": attrition_count,
+        },
+        "attrition_by_department": attrition_agg(filtered_df, "Department"),
+        "attrition_by_job_role": attrition_agg(filtered_df, "JobRole"),
+        "attrition_by_job_level": attrition_agg(filtered_df, "JobLevel"),
+        "attrition_by_overtime": attrition_agg(filtered_df, "OverTime"),
+        "attrition_by_job_satisfaction": attrition_agg(filtered_df, "JobSatisfaction"),
+        "attrition_by_worklife_balance": attrition_agg(filtered_df, "WorkLifeBalance"),
+        "attrition_by_tenure": attrition_agg(filtered_df, "TenureBand"),
+        "attrition_by_income_band": attrition_agg(filtered_df, "IncomeBand"),
+    }
+
+@app.get("/employees")
+def get_employees():
+    return df[["EmployeeNumber", "Department", "JobRole"]].drop_duplicates().rename(columns={"EmployeeNumber": "employee_id", "Department": "department", "JobRole": "job_role"}).to_dict("records")
+
+@app.get("/employee/{employee_id}")
+def get_employee(employee_id: int):
+    emp = df[df["EmployeeNumber"] == employee_id]
+    if emp.empty: return {"error": "Employee not found"}
+    r = emp.iloc[0]
+    return {
+        "employee_id": employee_id, "department": r["Department"], "job_role": r["JobRole"],
+        "job_level": int(r["JobLevel"]), "years_at_company": int(r["YearsAtCompany"]),
+        "years_with_manager": int(r["YearsWithCurrManager"]), "monthly_income": float(r["MonthlyIncome"]),
+        "job_satisfaction": int(r["JobSatisfaction"]), "work_life_balance": int(r["WorkLifeBalance"]),
+        "overtime": r["OverTime"],
+    }
+
+@app.get("/filters")
+def get_filter_options(departments: str = Query("")):
+    if departments:
+        dept_list = departments.split(',')
+        job_roles = []
+        for dept in dept_list:
+            if dept in JOB_ROLE_BY_DEPARTMENT:
+                job_roles.extend(JOB_ROLE_BY_DEPARTMENT[dept])
+        job_roles = sorted(list(set(job_roles)))
+    else:
+        job_roles = []
+    return {"departments": sorted(JOB_ROLE_BY_DEPARTMENT.keys()), "job_roles": job_roles}
+
+@app.get("/top_risk_employees")
+def get_top_risk_employees(limit: int = 5):
+    global TOP_RISK_CACHE
+    if TOP_RISK_CACHE is None:
+        TOP_RISK_CACHE = compute_top_risk_employees(limit)
+    return TOP_RISK_CACHE
+
+# --------------------------------------------------
+# PREDICT (DETERMINISTIC)
+# --------------------------------------------------
+@app.post("/predict")
+def predict_attrition(req: PredictRequest):
+    emp = df[df["EmployeeNumber"] == req.employee_id]
+    if emp.empty: return {"error": "Employee not found"}
+
+    row = emp.iloc[0].copy()
+    for feature, value in req.what_if.items():
+        if feature in row: row[feature] = value
+
+    X = build_feature_vector(row)
+
+    if req.model_name == "ensemble":
+        probs = [model.predict_proba(X)[0][1] for model in models.values()]
+        risk_prob = np.mean(probs)
+    else:
+        model_key = req.model_name.lower().replace(" ", "_")
+        if model_key not in models: return {"error": f"Model {req.model_name} not found"}
+        risk_prob = models[model_key].predict_proba(X)[0][1]
+
+    risk_level = "High" if risk_prob >= 0.7 else "Medium" if risk_prob >= 0.4 else "Low"
+    _, key_drivers = generate_recommendations(row, req.what_if)
+    
+    metrics_key = req.model_name.lower().replace(" ", "_")
+    selected_metrics = MODEL_METRICS.get(metrics_key, MODEL_METRICS["random_forest"])
+
+    return {
+        "employee_id": req.employee_id,
+        "risk_probability": round(float(risk_prob) * 100, 2),
+        "risk_level": risk_level,
+        "model_used": req.model_name,
+        "key_drivers": key_drivers,
+        "model_metrics": selected_metrics,
+    }
+
+# --------------------------------------------------
+# LLM RECOMMENDATIONS (ON-DEMAND)
+# --------------------------------------------------
+@app.post("/generate_recommendations")
+def get_ai_recommendations(req: RecommendationRequest):
+    global credits_used
+
+    if credits_used >= DAILY_LIMIT:
+        return {
+            "error": "Daily limit reached.", 
+            "recommendations": ["Daily AI limit reached. Please try again tomorrow."],
+            "credits_remaining": 0
+        }
+
+    prompt = f"""
+    You are an HR Analytics expert. An employee (ID: {req.employee_id}) has an attrition risk probability of {req.risk_probability}% (Risk Level: {req.risk_level}).
+    
+    Here are the specific risk drivers and their impact levels calculated by our ML model:
+    {json.dumps(req.key_drivers)}
+
+    Based on these specific drivers and the overall risk level, provide 3 to 4 short, highly actionable recommendations for the manager to retain this employee.
+    Respond STRICTLY with a valid JSON array of strings. Example: ["Recommendation 1", "Recommendation 2"]
+    """
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config={"response_mime_type": "application/json"}
+        )
+        llm_recommendations = json.loads(response.text)
+        credits_used += 1
+
+    except Exception as e:
+        print(f"Gemini API Error: {e}")
+        llm_recommendations = ["Could not generate AI recommendations at this time. Please check system logs."]
+
+    return {
+        "recommendations": llm_recommendations,
+        "credits_remaining": DAILY_LIMIT - credits_used
+    }
